@@ -30,6 +30,8 @@
 #include "stm32f1xx_hal.h"
 #include "main.h"
 #include "pn532_stm32f1.h"
+#include <stdio.h>
+#include <string.h>
 
 #define _SPI_STATREAD                   0x02
 #define _SPI_DATAWRITE                  0x01
@@ -38,6 +40,7 @@
 
 #define _SPI_TIMEOUT                    10
 // This indicates if the bits read/write should be reversed
+// Comment out if your SPI is MSB first (most common)
 #define _SPI_HARDWARE_LSB
 
 #define _I2C_ADDRESS                    0x48
@@ -45,22 +48,24 @@
 
 extern SPI_HandleTypeDef hspi1;
 extern I2C_HandleTypeDef hi2c1;
+extern UART_HandleTypeDef huart1;
 
 /**************************************************************************
  * Reset and Log implements
  **************************************************************************/
 int PN532_Reset(void) {
-    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_RESET);
-    HAL_Delay(500);
-    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
+	// If you have a reset pin connected,uncomment
+//    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_SET);
+//    HAL_Delay(100);
+//    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_RESET);
+//    HAL_Delay(500);
+//    HAL_GPIO_WritePin(PN532_RST_GPIO_Port, PN532_RST_Pin, GPIO_PIN_SET);
+//    HAL_Delay(100);
     return PN532_STATUS_OK;
 }
 
 void PN532_Log(const char* log) {
-    printf("%s\r\n", log);
+	HAL_UART_Transmit(&huart1, (uint8_t*)log, strlen(log), 1000);
 }
 
 void PN532_Init(PN532* pn532) {
@@ -83,23 +88,28 @@ uint8_t reverse_bit(uint8_t num) {
 }
 
 void spi_rw(uint8_t* data, uint8_t count) {
-    HAL_GPIO_WritePin(SS_GPIO_Port, SS_Pin, GPIO_PIN_RESET);
-    HAL_Delay(1);
-#ifndef _SPI_HARDWARE_LSB
+    // CS Low (PA4)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(5);  // Longer setup time for PHASE_2EDGE
+
+#ifdef _SPI_HARDWARE_LSB
+    // If your hardware requires bit reversal
     for (uint8_t i = 0; i < count; i++) {
         data[i] = reverse_bit(data[i]);
     }
-    HAL_SPI_TransmitReceive(&hspi1, data, data, count, _SPI_TIMEOUT);
+    HAL_SPI_TransmitReceive(&hspi1, data, data, count, 1000);
     for (uint8_t i = 0; i < count; i++) {
         data[i] = reverse_bit(data[i]);
     }
 #else
-    HAL_SPI_TransmitReceive(&hspi1, data, data, count, _SPI_TIMEOUT);
+    // Standard SPI communication (MSB first)
+    HAL_SPI_TransmitReceive(&hspi1, data, data, count, 1000);
 #endif
-    HAL_Delay(1);
-    HAL_GPIO_WritePin(SS_GPIO_Port, SS_Pin, GPIO_PIN_SET);
-}
 
+    HAL_Delay(5);  // Longer hold time for PHASE_2EDGE
+    // CS High (PA4)
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+}
 int PN532_SPI_ReadData(uint8_t* data, uint16_t count) {
     uint8_t frame[count + 1];
     frame[0] = _SPI_DATAREAD;
@@ -137,13 +147,29 @@ bool PN532_SPI_WaitReady(uint32_t timeout) {
 }
 
 int PN532_SPI_Wakeup(void) {
-    // Send any special commands/data to wake up PN532
-    uint8_t data[] = {0x00};
-    HAL_Delay(1000);
-    HAL_GPIO_WritePin(SS_GPIO_Port, SS_Pin, GPIO_PIN_RESET);
-    HAL_Delay(2); // T_osc_start
-    spi_rw(data, 1);
-    HAL_Delay(1000);
+    // Enhanced wakeup sequence for better reliability with PHASE_2EDGE
+
+    // Step 1: Extended reset sequence
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(200);  // Much longer reset
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+    HAL_Delay(200);  // Stabilization time
+
+    // Step 2: Send wakeup command multiple times
+    uint8_t wakeup_cmd = 0x55;
+
+    for (int i = 0; i < 3; i++) {  // Try multiple times
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+        HAL_Delay(10);
+        HAL_SPI_Transmit(&hspi1, &wakeup_cmd, 1, 1000);
+        HAL_Delay(10);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+        HAL_Delay(100);
+    }
+
+    // Step 3: Long stabilization wait
+    HAL_Delay(1500);  // Wait 1.5 seconds for full initialization
+
     return PN532_STATUS_OK;
 }
 
@@ -207,13 +233,14 @@ bool PN532_I2C_WaitReady(uint32_t timeout) {
 }
 
 int PN532_I2C_Wakeup(void) {
-    // TODO
-    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_SET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_RESET);
-    HAL_Delay(100);
-    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_SET);
-    HAL_Delay(500);
+//	// if using the IRQ ,uncoment
+//    // TODO
+//    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_SET);
+//    HAL_Delay(100);
+//    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_RESET);
+//    HAL_Delay(100);
+//    HAL_GPIO_WritePin(PN532_REQ_GPIO_Port, PN532_REQ_Pin, GPIO_PIN_SET);
+	  HAL_Delay(500);
     return PN532_STATUS_OK;
 }
 

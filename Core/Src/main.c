@@ -14,16 +14,37 @@
   * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
+  *
+  * Hardware Connections (STM32F103C8T6 Blue Pill):
+  * ================================================
+  * PN532 Module -> STM32 Blue Pill
+  * VCC  -> 3.3V
+  * GND  -> GND
+  * SCK  -> PA5 (SPI1_SCK)
+  * MISO -> PA6 (SPI1_MISO)
+  * MOSI -> PA7 (SPI1_MOSI)
+  * NSS  -> PA4 (GPIO Output, Software CS)
+  *
+  * Serial Debug:
+  * TX -> PA9 (USART1_TX)
+  * RX -> PA10 (USART1_RX)
+  * Baudrate: 115200
+  *
+  * PN532 Module Setup:
+  * Set I0I1 jumpers: I0=LOW, I1=HIGH (SPI Mode)
+  *
+  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "string.h"
+#include "pn532.h"
+#include "pn532_stm32f1.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,39 +54,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// NFC Module (PN532) I2C Address
-#define PN532_I2C_ADDRESS         0x48  // 7-bit address (0x24 << 1)
-
-// LCD I2C Address (PCF8574 based)
-#define LCD_I2C_ADDRESS           0x4E  // Adjust based on your LCD module (0x27 << 1)
-
-// PN532 Commands
-#define PN532_COMMAND_GETFIRMWAREVERSION    0x02
-#define PN532_COMMAND_SAMCONFIGURATION      0x14
-#define PN532_COMMAND_RFCONFIGURATION       0x32
-#define PN532_COMMAND_INLISTPASSIVETARGET   0x4A
-#define PN532_COMMAND_INDATAEXCHANGE        0x40
-#define PN532_COMMAND_INDESELECT            0x44
-
-// MIFARE Commands
-#define MIFARE_READ                 0x30
-#define MIFARE_WRITE                0xA0
-#define MIFARE_ULTRALIGHT_WRITE     0xA2
-
-// LCD Commands
-#define LCD_CLEAR_DISPLAY           0x01
-#define LCD_RETURN_HOME             0x02
-#define LCD_ENTRY_MODE_SET          0x04
-#define LCD_DISPLAY_CONTROL         0x08
-#define LCD_CURSOR_SHIFT            0x10
-#define LCD_FUNCTION_SET            0x20
-#define LCD_SET_CGRAM_ADDR          0x40
-#define LCD_SET_DDRAM_ADDR          0x80
-
-// LCD Control bits
-#define LCD_ENABLE_BIT              0x04
-#define LCD_BACKLIGHT               0x08
-#define LCD_RS_BIT                  0x01
 
 /* USER CODE END PD */
 
@@ -83,8 +71,9 @@ SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart1;
 
-osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
+PN532 pn532;
+char uart_buffer[200];
 uint8_t nfc_uid[10];
 uint8_t nfc_uid_length = 0;
 /* USER CODE END PV */
@@ -97,29 +86,12 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_USART1_UART_Init(void);
-void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-// NFC Functions
-HAL_StatusTypeDef PN532_Init(void);
-HAL_StatusTypeDef PN532_GetFirmwareVersion(uint32_t *version);
-HAL_StatusTypeDef PN532_SAMConfig(void);
-HAL_StatusTypeDef PN532_ReadPassiveTarget(uint8_t *uid, uint8_t *uid_len);
-HAL_StatusTypeDef PN532_ReadBlock(uint8_t block, uint8_t *data);
-HAL_StatusTypeDef PN532_WriteBlock(uint8_t block, uint8_t *data);
-
-// LCD Functions
-void LCD_Init(void);
-void LCD_Clear(void);
-void LCD_SetCursor(uint8_t row, uint8_t col);
-void LCD_Print(char *str);
-void LCD_SendCommand(uint8_t cmd);
-void LCD_SendData(uint8_t data);
-void LCD_SendNibble(uint8_t nibble, uint8_t rs);
-
-// Utility Functions
-void PN532_SendCommand(uint8_t *cmd, uint8_t cmd_len);
-HAL_StatusTypeDef PN532_ReadResponse(uint8_t *response, uint8_t *response_len);
+/* Diagnostic Functions */
+void Test_SPI_Connection(void);
+void Test_PN532_Wakeup(void);
+void Test_Raw_SPI_Communication(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -136,9 +108,6 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
-	  char lcd_buffer[32];
-	  uint8_t card_data[16];
-	  uint8_t write_data[16] = "Hello NFC World!";
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -165,118 +134,257 @@ int main(void)
   MX_SPI2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-    // Initialize LCD
-    HAL_Delay(100);
-    LCD_Init();
-    LCD_Clear();
-    LCD_Print("NFC Reader Ready");
+  // Send startup message
+  sprintf(uart_buffer, "\r\n=== STM32 Blue Pill + PN532 NFC Reader ===\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
 
-    // Initialize NFC module
-    if (PN532_Init() == HAL_OK) {
-      LCD_SetCursor(1, 0);
-      LCD_Print("PN532 OK!");
-      HAL_Delay(1000);
-    } else {
-      LCD_SetCursor(1, 0);
-      LCD_Print("PN532 Error!");
-      while(1);
-    }
+  sprintf(uart_buffer, "Initializing PN532...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
 
-    LCD_Clear();
-    LCD_Print("Place NFC card...");
+  // Step 1: Test basic SPI
+  sprintf(uart_buffer, "Step 1: Testing SPI connection...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  Test_SPI_Connection();
+
+  HAL_Delay(1000);
+
+  // Step 2: Test raw SPI communication
+  sprintf(uart_buffer, "Step 2: Testing raw SPI communication...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  Test_Raw_SPI_Communication();
+
+  HAL_Delay(1000);
+
+  // Step 3: Test PN532 wakeup
+  sprintf(uart_buffer, "Step 3: Testing PN532 wakeup sequence...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  Test_PN532_Wakeup();
+
+  HAL_Delay(1000);
+
+  // Initialize PN532
+  PN532_Init(&pn532);
+
+  HAL_Delay(1000);
+
+  // Get firmware version
+  uint8_t version[4];
+  if (PN532_GetFirmwareVersion(&pn532, version) == PN532_STATUS_OK) {
+    sprintf(uart_buffer, "PN532 Firmware Version: %d.%d\r\n", version[1], version[2]);
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+    sprintf(uart_buffer, "IC: PN5%02X, Support: 0x%02X\r\n", version[0], version[3]);
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  } else {
+    sprintf(uart_buffer, "ERROR: Failed to get firmware version!\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+    sprintf(uart_buffer, "Check connections and PN532 module!\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+    // You might want to continue anyway for debugging
+    // while(1); // Uncomment to stop on error
+  }
+
+  // Configure SAM
+  if (PN532_SamConfiguration(&pn532) == PN532_STATUS_OK) {
+    sprintf(uart_buffer, "SAM configuration successful!\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  } else {
+    sprintf(uart_buffer, "Warning: SAM configuration failed!\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  }
+
+  sprintf(uart_buffer, "\r\nReady! Place an NFC card near the reader...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+  sprintf(uart_buffer, "==========================================\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
   /* USER CODE END 2 */
-
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
-  /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  /* Turn on the LED (active low, so set PC13 to RESSET) */
-	      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    /* Turn on the LED (active low, so set PC13 to RESET) */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
-
-
-
-	      // Try to read NFC card
-	      if (PN532_ReadPassiveTarget(nfc_uid, &nfc_uid_length) == HAL_OK) {
-	        // Card detected
-	        LCD_Clear();
-	        LCD_Print("Card Found!");
-
-	        // Display UID
-	        LCD_SetCursor(1, 0);
-	        sprintf(lcd_buffer, "UID: %02X%02X%02X%02X",
-	                nfc_uid[0], nfc_uid[1], nfc_uid[2], nfc_uid[3]);
-	        LCD_Print(lcd_buffer);
-
-	        HAL_Delay(2000);
-
-	        // Try to read block 4 (first user data block in MIFARE Classic)
-	        if (PN532_ReadBlock(4, card_data) == HAL_OK) {
-	          LCD_Clear();
-	          LCD_Print("Read Success:");
-	          LCD_SetCursor(1, 0);
-	          // Display first 16 characters
-	          card_data[15] = '\0';  // Ensure null termination
-	          LCD_Print((char*)card_data);
-	          HAL_Delay(3000);
-
-	          // Write new data to the card
-	          if (PN532_WriteBlock(4, write_data) == HAL_OK) {
-	            LCD_Clear();
-	            LCD_Print("Write Success!");
-	            HAL_Delay(2000);
-	          } else {
-	            LCD_Clear();
-	            LCD_Print("Write Failed!");
-	            HAL_Delay(2000);
-	          }
-	        } else {
-	          LCD_Clear();
-	          LCD_Print("Read Failed!");
-	          HAL_Delay(2000);
-	        }
-
-	        LCD_Clear();
-	        LCD_Print("Place NFC card...");
-	      }
-
-	      HAL_Delay(500);  // Check for cards every 500ms
-	    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint8_t uid[10]; // Buffer for UID (max 10 bytes for triple size UID)
+
+    // Try to read a card
+    int uid_length = PN532_ReadPassiveTarget(&pn532, uid, PN532_MIFARE_ISO14443A, 1000);
+
+    if (uid_length > 0) {
+      // Card found!
+      sprintf(uart_buffer, "*** NFC CARD DETECTED! ***\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      sprintf(uart_buffer, "UID Length: %d bytes\r\n", uid_length);
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      sprintf(uart_buffer, "UID (Hex): ");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      // Print UID in hexadecimal
+      for (int i = 0; i < uid_length; i++) {
+        sprintf(uart_buffer, "%02X", uid[i]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+        if (i < uid_length - 1) {
+          sprintf(uart_buffer, " ");
+          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+        }
+      }
+      sprintf(uart_buffer, "\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      // Print UID in decimal
+      sprintf(uart_buffer, "UID (Dec): ");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      for (int i = 0; i < uid_length; i++) {
+        sprintf(uart_buffer, "%d", uid[i]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+        if (i < uid_length - 1) {
+          sprintf(uart_buffer, " ");
+          HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+        }
+      }
+      sprintf(uart_buffer, "\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      // Calculate and display UID as a single number (for shorter UIDs)
+      if (uid_length <= 4) {
+        uint32_t uid_number = 0;
+        for (int i = 0; i < uid_length; i++) {
+          uid_number = (uid_number << 8) | uid[i];
+        }
+        sprintf(uart_buffer, "UID (Number): %lu\r\n", uid_number);
+        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+      }
+
+      sprintf(uart_buffer, "==========================================\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+      // Wait before next read to avoid spamming
+      HAL_Delay(2000);
+
+      sprintf(uart_buffer, "Remove card and place another one...\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+    } else {
+      // No card found or error
+      // Only print error message occasionally to avoid spam
+      static uint32_t last_no_card_message = 0;
+      if (HAL_GetTick() - last_no_card_message > 5000) { // Every 5 seconds
+        sprintf(uart_buffer, "Scanning for NFC cards...\r\n");
+        HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+        last_no_card_message = HAL_GetTick();
+      }
+    }
+
+    // Small delay between scans
+    HAL_Delay(500);
+  }
   /* USER CODE END 3 */
 }
+
+/* USER CODE BEGIN 4 */
+/* Diagnostic Functions */
+
+void Test_SPI_Connection(void) {
+  // Test basic SPI functionality
+  uint8_t test_data = 0xAA;
+  uint8_t received_data = 0x00;
+
+  sprintf(uart_buffer, "  - CS pin test (PA4)...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_Delay(10);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+  sprintf(uart_buffer, "  - SPI loopback test...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_SPI_TransmitReceive(&hspi1, &test_data, &received_data, 1, 1000);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+  sprintf(uart_buffer, "  - Sent: 0x%02X, Received: 0x%02X\r\n", test_data, received_data);
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+}
+
+void Test_Raw_SPI_Communication(void) {
+  // Test raw PN532 SPI commands
+  uint8_t status_cmd[2] = {0x02, 0x00}; // Status read command
+
+  sprintf(uart_buffer, "  - Sending status read command...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_Delay(1);
+  HAL_SPI_TransmitReceive(&hspi1, status_cmd, status_cmd, 2, 1000);
+  HAL_Delay(1);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+  sprintf(uart_buffer, "  - Status response: 0x%02X 0x%02X\r\n", status_cmd[0], status_cmd[1]);
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+  if (status_cmd[1] == 0x01) {
+    sprintf(uart_buffer, "  - PN532 appears to be ready!\r\n");
+  } else {
+    sprintf(uart_buffer, "  - PN532 not ready or not connected\r\n");
+  }
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+}
+
+void Test_PN532_Wakeup(void) {
+  sprintf(uart_buffer, "  - Enhanced wakeup sequence...\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+  // Step 1: Long reset pulse
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_Delay(100);  // Hold CS low longer
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_Delay(100);  // Wait for stabilization
+
+  // Step 2: Send proper wakeup command
+  uint8_t wakeup_data = 0x55;  // PN532 wakeup command
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  HAL_Delay(10);  // Longer setup time
+  HAL_SPI_Transmit(&hspi1, &wakeup_data, 1, 1000);
+  HAL_Delay(10);  // Longer hold time
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+  HAL_Delay(1000);  // Wait much longer for PN532 to wake up
+
+  // Step 3: Multiple status checks
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    uint8_t status_cmd[2] = {0x02, 0x00};
+
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_Delay(5);  // Longer setup
+    HAL_SPI_TransmitReceive(&hspi1, status_cmd, status_cmd, 2, 1000);
+    HAL_Delay(5);  // Longer hold
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+    sprintf(uart_buffer, "  - Attempt %d - Status: 0x%02X 0x%02X\r\n", attempt, status_cmd[0], status_cmd[1]);
+    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+
+    if (status_cmd[1] == 0x01) {
+      sprintf(uart_buffer, "  - PN532 is READY!\r\n");
+      HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+      return;
+    }
+
+    HAL_Delay(200);  // Wait between attempts
+  }
+
+  sprintf(uart_buffer, "  - PN532 did not become ready after 5 attempts\r\n");
+  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 1000);
+}
+/* USER CODE END 4 */
 
 /**
   * @brief System Clock Configuration
@@ -405,7 +513,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -534,265 +642,6 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
-/* USER CODE BEGIN 4 */
-
-// ===== NFC Functions =====
-
-HAL_StatusTypeDef PN532_Init(void) {
-  uint32_t version;
-
-  // Get firmware version to test communication
-  if (PN532_GetFirmwareVersion(&version) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  // Configure SAM (Security Access Module)
-  if (PN532_SAMConfig() != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  return HAL_OK;
-}
-
-HAL_StatusTypeDef PN532_GetFirmwareVersion(uint32_t *version) {
-  uint8_t cmd[] = {0x00, 0x00, 0xFF, 0x02, 0xFE, 0xD4, 0x02, 0x2A, 0x00};
-  uint8_t response[32];
-  uint8_t response_len = 0;
-
-  if (HAL_I2C_Master_Transmit(&hi2c1, PN532_I2C_ADDRESS, cmd, sizeof(cmd), 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  HAL_Delay(50);
-
-  if (PN532_ReadResponse(response, &response_len) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  if (response_len >= 12 && response[7] == 0xD5 && response[8] == 0x03) {
-    *version = (response[9] << 24) | (response[10] << 16) | (response[11] << 8) | response[12];
-    return HAL_OK;
-  }
-
-  return HAL_ERROR;
-}
-
-HAL_StatusTypeDef PN532_SAMConfig(void) {
-  uint8_t cmd[] = {0x00, 0x00, 0xFF, 0x05, 0xFB, 0xD4, 0x14, 0x01, 0x14, 0x01, 0x02, 0x00};
-  uint8_t response[32];
-  uint8_t response_len = 0;
-
-  if (HAL_I2C_Master_Transmit(&hi2c1, PN532_I2C_ADDRESS, cmd, sizeof(cmd), 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  HAL_Delay(50);
-
-  if (PN532_ReadResponse(response, &response_len) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  return HAL_OK;
-}
-
-HAL_StatusTypeDef PN532_ReadPassiveTarget(uint8_t *uid, uint8_t *uid_len) {
-  uint8_t cmd[] = {0x00, 0x00, 0xFF, 0x04, 0xFC, 0xD4, 0x4A, 0x01, 0x00, 0xE1, 0x00};
-  uint8_t response[64];
-  uint8_t response_len = 0;
-
-  if (HAL_I2C_Master_Transmit(&hi2c1, PN532_I2C_ADDRESS, cmd, sizeof(cmd), 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  HAL_Delay(100);
-
-  if (PN532_ReadResponse(response, &response_len) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  if (response_len >= 19 && response[7] == 0xD5 && response[8] == 0x4B && response[9] == 0x01) {
-    *uid_len = response[12];
-    memcpy(uid, &response[13], *uid_len);
-    return HAL_OK;
-  }
-
-  return HAL_ERROR;
-}
-
-HAL_StatusTypeDef PN532_ReadBlock(uint8_t block, uint8_t *data) {
-  uint8_t cmd[] = {0x00, 0x00, 0xFF, 0x05, 0xFB, 0xD4, 0x40, 0x01, 0x30, block, 0x00};
-  uint8_t response[64];
-  uint8_t response_len = 0;
-
-  // Calculate checksum
-  uint8_t checksum = 0xD4 + 0x40 + 0x01 + 0x30 + block;
-  cmd[9] = block;
-  cmd[10] = (~checksum + 1) & 0xFF;
-
-  if (HAL_I2C_Master_Transmit(&hi2c1, PN532_I2C_ADDRESS, cmd, sizeof(cmd), 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  HAL_Delay(100);
-
-  if (PN532_ReadResponse(response, &response_len) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  if (response_len >= 26 && response[7] == 0xD5 && response[8] == 0x41 && response[9] == 0x00) {
-    memcpy(data, &response[10], 16);
-    return HAL_OK;
-  }
-
-  return HAL_ERROR;
-}
-
-HAL_StatusTypeDef PN532_WriteBlock(uint8_t block, uint8_t *data) {
-  uint8_t cmd[27] = {0x00, 0x00, 0xFF, 0x15, 0xEB, 0xD4, 0x40, 0x01, 0xA0, block};
-  uint8_t response[32];
-  uint8_t response_len = 0;
-
-  // Copy data to command
-  memcpy(&cmd[10], data, 16);
-
-  // Calculate checksum
-  uint8_t checksum = 0xD4 + 0x40 + 0x01 + 0xA0 + block;
-  for (int i = 0; i < 16; i++) {
-    checksum += data[i];
-  }
-  cmd[26] = (~checksum + 1) & 0xFF;
-
-  if (HAL_I2C_Master_Transmit(&hi2c1, PN532_I2C_ADDRESS, cmd, sizeof(cmd), 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  HAL_Delay(100);
-
-  if (PN532_ReadResponse(response, &response_len) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  if (response_len >= 10 && response[7] == 0xD5 && response[8] == 0x41 && response[9] == 0x00) {
-    return HAL_OK;
-  }
-
-  return HAL_ERROR;
-}
-
-HAL_StatusTypeDef PN532_ReadResponse(uint8_t *response, uint8_t *response_len) {
-  uint8_t ready_byte;
-
-  // Check if PN532 is ready
-  if (HAL_I2C_Master_Receive(&hi2c1, PN532_I2C_ADDRESS, &ready_byte, 1, 100) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  if (ready_byte != 0x01) {
-    return HAL_ERROR;
-  }
-
-  // Read response
-  if (HAL_I2C_Master_Receive(&hi2c1, PN532_I2C_ADDRESS, response, 64, 1000) != HAL_OK) {
-    return HAL_ERROR;
-  }
-
-  *response_len = 64;  // Simplified - should parse actual length
-  return HAL_OK;
-}
-
-// ===== LCD Functions =====
-
-void LCD_Init(void) {
-  HAL_Delay(50);
-
-  // Initialize in 4-bit mode
-  LCD_SendNibble(0x03, 0);
-  HAL_Delay(5);
-  LCD_SendNibble(0x03, 0);
-  HAL_Delay(1);
-  LCD_SendNibble(0x03, 0);
-  HAL_Delay(1);
-  LCD_SendNibble(0x02, 0);  // Switch to 4-bit mode
-  HAL_Delay(1);
-
-  // Function set: 4-bit, 2 lines, 5x8 dots
-  LCD_SendCommand(LCD_FUNCTION_SET | 0x08);
-  // Display control: display on, cursor off, blink off
-  LCD_SendCommand(LCD_DISPLAY_CONTROL | 0x04);
-  // Clear display
-  LCD_SendCommand(LCD_CLEAR_DISPLAY);
-  HAL_Delay(2);
-  // Entry mode: increment cursor, no shift
-  LCD_SendCommand(LCD_ENTRY_MODE_SET | 0x02);
-}
-
-void LCD_Clear(void) {
-  LCD_SendCommand(LCD_CLEAR_DISPLAY);
-  HAL_Delay(2);
-}
-
-void LCD_SetCursor(uint8_t row, uint8_t col) {
-  uint8_t address = (row == 0) ? 0x00 : 0x40;
-  address += col;
-  LCD_SendCommand(LCD_SET_DDRAM_ADDR | address);
-}
-
-void LCD_Print(char *str) {
-  while (*str) {
-    LCD_SendData(*str++);
-  }
-}
-
-void LCD_SendCommand(uint8_t cmd) {
-  uint8_t upper_nibble = (cmd & 0xF0);
-  uint8_t lower_nibble = ((cmd << 4) & 0xF0);
-
-  LCD_SendNibble(upper_nibble, 0);
-  LCD_SendNibble(lower_nibble, 0);
-}
-
-void LCD_SendData(uint8_t data) {
-  uint8_t upper_nibble = (data & 0xF0);
-  uint8_t lower_nibble = ((data << 4) & 0xF0);
-
-  LCD_SendNibble(upper_nibble, LCD_RS_BIT);
-  LCD_SendNibble(lower_nibble, LCD_RS_BIT);
-}
-
-void LCD_SendNibble(uint8_t nibble, uint8_t rs) {
-  uint8_t data = nibble | rs | LCD_BACKLIGHT;
-
-  // Send with enable high
-  data |= LCD_ENABLE_BIT;
-  HAL_I2C_Master_Transmit(&hi2c2, LCD_I2C_ADDRESS, &data, 1, 100);
-  HAL_Delay(1);
-
-  // Send with enable low
-  data &= ~LCD_ENABLE_BIT;
-  HAL_I2C_Master_Transmit(&hi2c2, LCD_I2C_ADDRESS, &data, 1, 100);
-  HAL_Delay(1);
-}
-
-/* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void const * argument)
-{
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END 5 */
-}
-
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
@@ -807,6 +656,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
